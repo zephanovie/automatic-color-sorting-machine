@@ -1,0 +1,391 @@
+#include <Wire.h>
+#include <Adafruit_TCS34725.h>
+#include <ESP32Servo.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
+
+// ─────────────────────────────────────────────────────────────
+// PIN DEFINITIONS
+// ─────────────────────────────────────────────────────────────
+#define IR_SENSOR_PIN    34
+#define SORT_SERVO_PIN   13
+#define TOP_SERVO_PIN    14
+#define BOTTOM_SERVO_PIN 27
+#define SDA_PIN          25
+#define SCL_PIN          26
+
+// ─────────────────────────────────────────────────────────────
+// OLED
+// ─────────────────────────────────────────────────────────────
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+#define OLED_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// ─────────────────────────────────────────────────────────────
+// SORTING SERVO ANGLES
+// ─────────────────────────────────────────────────────────────
+#define SERVO_HOME   0
+#define SERVO_SWEEP 90
+
+// ─────────────────────────────────────────────────────────────
+// DISPENSER SERVO ANGLES
+// ─────────────────────────────────────────────────────────────
+#define TOP_OPEN      75
+#define TOP_CLOSED   150
+#define BOTTOM_CLOSED  0
+#define BOTTOM_OPEN   90
+
+// ─────────────────────────────────────────────────────────────
+// DISPENSER TIMING
+// ─────────────────────────────────────────────────────────────
+#define DISPENSE_INTERVAL  2500
+#define TOP_CLOSE_TIME      300
+#define BOTTOM_OPEN_TIME    350
+#define BOTTOM_CLOSE_TIME   350
+#define TOP_OPEN_TIME       300
+
+// ─────────────────────────────────────────────────────────────
+// DETECTION THRESHOLDS (ratio based)
+// ─────────────────────────────────────────────────────────────
+#define BLUE_RATIO_MIN   0.42  // B/total > 0.42 → blue
+#define GREEN_RATIO_MIN  0.42  // G/total > 0.42 → green
+#define RED_RATIO_MIN    0.55  // R/total > 0.55 → red
+#define MIN_CLEAR        40    // below this = no object
+
+// ─────────────────────────────────────────────────────────────
+// TIMING
+// ─────────────────────────────────────────────────────────────
+#define SWEEP_HOLD_TIME    500
+#define COLOUR_READ_DELAY  150
+#define DEBOUNCE_DELAY     800
+
+// ─────────────────────────────────────────────────────────────
+// QUEUE
+// ─────────────────────────────────────────────────────────────
+#define QUEUE_SIZE 10
+enum Colour { BLUE, GREEN, RED, NOT_BLUE, UNKNOWN };
+Colour colourQueue[QUEUE_SIZE];
+int queueHead  = 0;
+int queueTail  = 0;
+int queueCount = 0;
+
+// ─────────────────────────────────────────────────────────────
+// OBJECTS
+// ─────────────────────────────────────────────────────────────
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(
+  TCS34725_INTEGRATIONTIME_154MS,
+  TCS34725_GAIN_16X
+);
+Servo sortServo;
+Servo topServo;
+Servo bottomServo;
+
+// ─────────────────────────────────────────────────────────────
+// STATE
+// ─────────────────────────────────────────────────────────────
+Colour lastQueued          = UNKNOWN;
+bool   servoLeft           = true;
+unsigned long lastDispenseTime = 0;
+
+// ─────────────────────────────────────────────────────────────
+// STATS
+// ─────────────────────────────────────────────────────────────
+int totalBlue    = 0;
+int totalNotBlue = 0;
+
+// ─────────────────────────────────────────────────────────────
+// SETUP
+// ─────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  pinMode(IR_SENSOR_PIN, INPUT);
+
+  sortServo.attach(SORT_SERVO_PIN);
+  sortServo.write(SERVO_HOME);
+
+  topServo.attach(TOP_SERVO_PIN);
+  bottomServo.attach(BOTTOM_SERVO_PIN);
+  topServo.write(TOP_OPEN);
+  bottomServo.write(BOTTOM_CLOSED);
+  delay(500);
+
+  if (!tcs.begin()) {
+    Serial.println("ERROR: TCS34725 not found!");
+    while (1);
+  }
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    Serial.println("ERROR: OLED not found!");
+    while (1);
+  }
+
+  // Splash screen
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(10, 10);
+  display.println("BLUE CAP");
+  display.setCursor(10, 32);
+  display.println("SORTER");
+  display.setTextSize(1);
+  display.setCursor(20, 54);
+  display.println("INITIALISING...");
+  display.display();
+  delay(2000);
+
+  Serial.println("Blue sorter ready.");
+  updateDisplay(UNKNOWN, false);
+}
+
+// ─────────────────────────────────────────────────────────────
+// MAIN LOOP
+// ─────────────────────────────────────────────────────────────
+void loop() {
+  // Automatic dispensing
+  if (millis() - lastDispenseTime >= DISPENSE_INTERVAL) {
+    dispenseCap();
+    lastDispenseTime = millis();
+  }
+
+  // Read colour and build queue
+  readAndQueue();
+
+  // Sorting station
+  if (digitalRead(IR_SENSOR_PIN) == LOW) {
+    if (queueCount > 0) {
+      Colour next = dequeue();
+      Serial.print("IR triggered → Executing: ");
+      Serial.println(colourName(next));
+      updateDisplay(next, true);
+      sortCover(next);
+      updateDisplay(UNKNOWN, false);
+    } else {
+      Serial.println("IR triggered — queue empty");
+      updateDisplay(UNKNOWN, true);
+      delay(300);
+      updateDisplay(UNKNOWN, false);
+    }
+    delay(DEBOUNCE_DELAY);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// DISPENSER
+// ─────────────────────────────────────────────────────────────
+void dispenseCap() {
+  Serial.println("Dispensing cap...");
+
+  topServo.write(TOP_CLOSED);
+  delay(TOP_CLOSE_TIME);
+  delay(250);
+
+  bottomServo.write(BOTTOM_OPEN);
+  delay(BOTTOM_OPEN_TIME);
+  delay(300);
+
+  bottomServo.write(BOTTOM_CLOSED);
+  delay(BOTTOM_CLOSE_TIME);
+  delay(400);
+
+  topServo.write(TOP_OPEN);
+  delay(TOP_OPEN_TIME);
+  delay(250);
+}
+
+// ─────────────────────────────────────────────────────────────
+// COLOUR READING + QUEUEING
+// ─────────────────────────────────────────────────────────────
+void readAndQueue() {
+  uint16_t r, g, b, c;
+  tcs.getRawData(&r, &g, &b, &c);
+
+  // No object — confirmed gap between covers
+  if (c < MIN_CLEAR) {
+    if (lastQueued != UNKNOWN) {
+      Serial.println("Gap — ready for next cover");
+    }
+    lastQueued = UNKNOWN;
+    delay(COLOUR_READ_DELAY);
+    return;
+  }
+
+  float total      = r + g + b;
+  float blueRatio  = (total > 0) ? ((float)b / total) : 0;
+  float greenRatio = (total > 0) ? ((float)g / total) : 0;
+  float redRatio   = (total > 0) ? ((float)r / total) : 0;
+
+  Serial.printf("R:%d G:%d B:%d | Br:%.2f Gr:%.2f Rr:%.2f\n",
+                 r, g, b, blueRatio, greenRatio, redRatio);
+
+  Colour detected = UNKNOWN;
+
+  if (blueRatio >= BLUE_RATIO_MIN)
+    detected = BLUE;
+  else if (greenRatio >= GREEN_RATIO_MIN)
+    detected = GREEN;
+  else if (redRatio >= RED_RATIO_MIN)
+    detected = RED;
+  else
+    detected = NOT_BLUE;  // fallback for any unrecognised colour
+
+  // Only queue on new detection — gap must have been seen first
+  if (detected != UNKNOWN && lastQueued == UNKNOWN) {
+    if (queueCount < QUEUE_SIZE) {
+      enqueue(detected);
+      lastQueued = detected;
+
+      if (detected == BLUE) totalBlue++;
+      else totalNotBlue++;
+
+      Serial.print("Queued: ");
+      Serial.print(colourName(detected));
+      Serial.print(" | Queue: ");
+      Serial.println(queueCount);
+
+      updateDisplay(UNKNOWN, false);
+    }
+  }
+
+  delay(COLOUR_READ_DELAY);
+}
+
+// ─────────────────────────────────────────────────────────────
+// QUEUE OPERATIONS
+// ─────────────────────────────────────────────────────────────
+void enqueue(Colour c) {
+  colourQueue[queueTail] = c;
+  queueTail = (queueTail + 1) % QUEUE_SIZE;
+  queueCount++;
+}
+
+Colour dequeue() {
+  Colour c = colourQueue[queueHead];
+  queueHead = (queueHead + 1) % QUEUE_SIZE;
+  queueCount--;
+  return c;
+}
+
+// ─────────────────────────────────────────────────────────────
+// SORTING LOGIC
+// ─────────────────────────────────────────────────────────────
+void sortCover(Colour c) {
+
+  switch (c) {
+
+    case BLUE:
+      Serial.println("→ Blue — pass through");
+      break;
+
+    case GREEN:
+    case RED:
+    case NOT_BLUE:
+
+      Serial.println("→ Non-blue — QUICK SWEEP");
+
+      // Small delay after IR detection
+      delay(20);
+
+      // Quick flick
+      sortServo.write(SERVO_SWEEP);
+
+      // Hold just long enough to knock the cover
+      delay(40);
+
+      // Return home immediately
+      sortServo.write(SERVO_HOME);
+
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// OLED DISPLAY
+// ─────────────────────────────────────────────────────────────
+void updateDisplay(Colour executing, bool irTriggered) {
+  display.clearDisplay();
+
+  // Title bar
+  display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(1);
+  display.setCursor(20, 2);
+  display.print("BLUE CAP SORTER");
+
+  // Queue grid
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 15);
+  display.print("QUEUE:");
+
+  int boxSize = 10;
+  int startX  = 0;
+  int startY  = 25;
+
+  for (int i = 0; i < QUEUE_SIZE; i++) {
+    int x = startX + i * (boxSize + 2);
+    int y = startY;
+
+    if (i < queueCount) {
+      int qIndex = (queueHead + i) % QUEUE_SIZE;
+
+      if (colourQueue[qIndex] == BLUE) {
+        // Filled box for blue
+        display.fillRect(x, y, boxSize, boxSize, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK);
+        display.setCursor(x + 2, y + 2);
+        display.print("B");
+        display.setTextColor(SSD1306_WHITE);
+      } else {
+        // Outline box for non-blue
+        display.drawRect(x, y, boxSize, boxSize, SSD1306_WHITE);
+        display.setCursor(x + 2, y + 2);
+        // Show R G or X depending on colour
+        if (colourQueue[qIndex] == RED)        display.print("R");
+        else if (colourQueue[qIndex] == GREEN) display.print("G");
+        else                                   display.print("X");
+      }
+    } else {
+      // Empty slot
+      display.drawRect(x, y, boxSize, boxSize, SSD1306_WHITE);
+    }
+  }
+
+  // IR status line
+  if (irTriggered) {
+    display.setCursor(0, 40);
+    if (executing == BLUE)         display.print(">> BLUE  : PASS");
+    else if (executing == RED)     display.print(">> RED   : SWEEP");
+    else if (executing == GREEN)   display.print(">> GREEN : SWEEP");
+    else if (executing == NOT_BLUE)display.print(">> OTHER : SWEEP");
+    else                           display.print(">> IR : NO ACTION");
+  }
+
+  // Stats bar
+  display.setCursor(0, 54);
+  display.print("B:");
+  display.print(totalBlue);
+  display.print(" X:");
+  display.print(totalNotBlue);
+  display.print(" Q:");
+  display.print(queueCount);
+
+  display.display();
+}
+
+// ─────────────────────────────────────────────────────────────
+// HELPER
+// ─────────────────────────────────────────────────────────────
+String colourName(Colour c) {
+  switch (c) {
+    case BLUE:     return "BLUE";
+    case GREEN:    return "GREEN";
+    case RED:      return "RED";
+    case NOT_BLUE: return "NOT_BLUE";
+    default:       return "UNKNOWN";
+     }
+    }
