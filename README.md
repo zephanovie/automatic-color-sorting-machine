@@ -1,7 +1,7 @@
 # Automatic Color Sorting Machine
 
 ## Overview
-An Arduino-based automatic color sorting machine that detects object colors and automatically sorts them into designated sections. Check the Project Report for more Info
+An Arduino-based automatic color sorting machine that detects object colors and automatically sorts them into designated sections. Check the [Project Report](Report/colour_sorting_machine.pdf) for more Info
 
 ## Features
 - Automatic color detection
